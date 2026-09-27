@@ -38,9 +38,13 @@ struct GeminiClient: Sendable {
                     configuration.timeoutIntervalForRequest = timeout
                     let (bytes, response) = try await URLSession(configuration: configuration).bytes(for: request)
                     guard let http = response as? HTTPURLResponse, http.statusCode < 400 else {
+                        var errorBody: [UInt8] = []
+                        for try await byte in bytes {
+                            errorBody.append(byte)
+                        }
                         throw GeminiAPIError(
                             status: (response as? HTTPURLResponse)?.statusCode ?? 0,
-                            message: "Gemini request failed",
+                            message: String(decoding: errorBody, as: UTF8.self),
                             requestID: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
                         )
                     }

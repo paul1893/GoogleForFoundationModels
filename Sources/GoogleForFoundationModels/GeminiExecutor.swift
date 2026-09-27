@@ -108,7 +108,24 @@ enum GeminiRequestBuilder {
         }
         generationConfig["temperature"] = .number(request.generationOptions.temperature)
 
-        if let schema = request.schema {
+        var hasToolOutput = false
+        for entry in request.transcript {
+            switch entry {
+            case .prompt:
+                // A new prompt starts a new tool-calling phase.
+                hasToolOutput = false
+            case .toolOutput:
+                hasToolOutput = true
+            default:
+                break
+            }
+        }
+        let defersStructuredOutput = request.schema != nil
+            && request.generationOptions.toolCallingMode == .required
+            && !hasToolOutput
+        let includesStructuredOutput = request.schema != nil && !defersStructuredOutput
+
+        if includesStructuredOutput, let schema = request.schema {
             guard model.capabilities.structuredOutput else {
                 throw LanguageModelError.unsupportedGenerationGuide(.init(
                     schemaName: nil,
@@ -143,6 +160,15 @@ enum GeminiRequestBuilder {
             body["tools"] = .array([.object([
                 "functionDeclarations": .array(request.enabledToolDefinitions.map(functionDeclaration))
             ])])
+            if !includesStructuredOutput,
+               let requestedMode = request.generationOptions.toolCallingMode,
+               let mode = functionCallingMode(for: requestedMode) {
+                body["toolConfig"] = .object([
+                    "functionCallingConfig": .object([
+                        "mode": .string(mode)
+                    ])
+                ])
+            }
         }
         return .object(body)
     }
@@ -212,26 +238,61 @@ enum GeminiRequestBuilder {
               let value = try? JSONDecoder().decode(GeminiJSONValue.self, from: data) else {
             return .object(["type": .string("OBJECT"), "properties": .object([:])])
         }
-        return sanitize(value)
+        let definitions = rootDefinitions(from: value)
+        return sanitize(value, definitions: definitions)
     }
 
     private static let allowedSchemaKeys: Set<String> = [
         "type", "properties", "required", "items", "enum", "format", "description",
-        "anyOf", "allOf", "oneOf", "$ref", "$defs", "definitions",
+        "anyOf", "allOf", "oneOf",
     ]
 
     private static let schemaMapKeys: Set<String> = ["properties", "$defs", "definitions"]
 
-    private static func sanitize(_ value: GeminiJSONValue) -> GeminiJSONValue {
+    private static func rootDefinitions(
+        from value: GeminiJSONValue
+    ) -> [String: GeminiJSONValue] {
+        guard case .object(let object) = value else { return [:] }
+
+        var result: [String: GeminiJSONValue] = [:]
+        for key in ["$defs", "definitions"] {
+            guard case .object(let definitions)? = object[key] else { continue }
+            result.merge(definitions) { current, _ in current }
+        }
+        return result
+    }
+
+    private static func sanitize(
+        _ value: GeminiJSONValue,
+        definitions: [String: GeminiJSONValue],
+        resolving: Set<String> = []
+    ) -> GeminiJSONValue {
         switch value {
         case .object(let object):
+            if case .string(let reference)? = object["$ref"],
+               let definitionName = definitionName(from: reference),
+               let definition = definitions[definitionName],
+               !resolving.contains(definitionName) {
+                return sanitize(
+                    definition,
+                    definitions: definitions,
+                    resolving: resolving.union([definitionName])
+                )
+            }
+
             var result: [String: GeminiJSONValue] = [:]
             for (key, value) in object where allowedSchemaKeys.contains(key) {
                 if schemaMapKeys.contains(key), case .object(let entries) = value {
                     // Preserve user-defined property and definition names.
-                    result[key] = .object(entries.mapValues(sanitize))
+                    result[key] = .object(entries.mapValues {
+                        sanitize($0, definitions: definitions, resolving: resolving)
+                    })
                 } else {
-                    result[key] = sanitize(value)
+                    result[key] = sanitize(
+                        value,
+                        definitions: definitions,
+                        resolving: resolving
+                    )
                 }
             }
             if case .string(let type)? = result["type"] {
@@ -241,18 +302,38 @@ enum GeminiRequestBuilder {
                 }
             }
             return .object(result)
-        case .array(let values): return .array(values.map(sanitize))
+        case .array(let values):
+            return .array(values.map {
+                sanitize($0, definitions: definitions, resolving: resolving)
+            })
         default: return value
         }
     }
 
+    private static func definitionName(from reference: String) -> String? {
+        let prefixes = ["#/$defs/", "#/definitions/"]
+        guard let prefix = prefixes.first(where: reference.hasPrefix) else { return nil }
+        let name = String(reference.dropFirst(prefix.count))
+        return name.isEmpty ? nil : name
+    }
+
     private static func thinkingBudget(for level: ContextOptions.ReasoningLevel?) -> Int? {
         switch level {
+        case .none: nil
         case .light: 512
         case .moderate: 2048
         case .deep: 8192
         case .custom(let value): Int(value)
         @unknown default: nil
+        }
+    }
+
+    private static func functionCallingMode(
+        for mode: GenerationOptions.ToolCallingMode
+    ) -> String? {
+        switch mode {
+        case .required: return "ANY"
+        default: return nil
         }
     }
 }
