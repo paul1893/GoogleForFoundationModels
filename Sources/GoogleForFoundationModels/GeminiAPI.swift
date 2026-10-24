@@ -36,17 +36,43 @@ struct GeminiClient: Sendable {
                     request.httpBody = try JSONEncoder().encode(body)
                     let configuration = URLSessionConfiguration.default
                     configuration.timeoutIntervalForRequest = timeout
-                    let (bytes, response) = try await URLSession(configuration: configuration).bytes(for: request)
-                    guard let http = response as? HTTPURLResponse, http.statusCode < 400 else {
-                        var errorBody: [UInt8] = []
-                        for try await byte in bytes {
-                            errorBody.append(byte)
+                    let session = URLSession(configuration: configuration)
+                    var (bytes, response) = try await session.bytes(for: request)
+                    var isRetry = false
+                    while true {
+                        guard let http = response as? HTTPURLResponse, http.statusCode < 400 else {
+                            var errorBody: [UInt8] = []
+                            for try await byte in bytes {
+                                errorBody.append(byte)
+                            }
+                            // Gemini sometimes refuses a valid request with a bare "Request contains an invalid
+                            // argument": the same request, replayed, was accepted. Sent once more, then the error.
+                            if (response as? HTTPURLResponse)?.statusCode == 400, !isRetry,
+                               String(decoding: errorBody, as: UTF8.self).contains("Request contains an invalid argument.") {
+                                isRetry = true
+                                try await Task.sleep(for: .milliseconds(500))
+                                (bytes, response) = try await session.bytes(for: request)
+                                continue
+                            }
+                            #if DEBUG
+                            // Gemini doesn't always say which argument is invalid: the request, to read it
+                            let requestFile = FileManager.default.temporaryDirectory
+                                .appending(path: "gemini-request-\(UUID().uuidString).json")
+                            try? request.httpBody?.write(to: requestFile)
+                            print("Gemini: HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0), request written to \(requestFile.path)")
+                            #endif
+                            throw GeminiAPIError(
+                                status: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                                message: String(decoding: errorBody, as: UTF8.self),
+                                requestID: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
+                            )
                         }
-                        throw GeminiAPIError(
-                            status: (response as? HTTPURLResponse)?.statusCode ?? 0,
-                            message: String(decoding: errorBody, as: UTF8.self),
-                            requestID: (response as? HTTPURLResponse)?.value(forHTTPHeaderField: "x-request-id")
-                        )
+                        #if DEBUG
+                        if isRetry {
+                            print("Gemini: accepted once sent again, after a bare HTTP 400")
+                        }
+                        #endif
+                        break
                     }
 
                     // SSE frames are separated by a blank line. AsyncBytes

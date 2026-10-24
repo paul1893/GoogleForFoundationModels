@@ -106,7 +106,10 @@ enum GeminiRequestBuilder {
         if let maximum = request.generationOptions.maximumResponseTokens {
             generationConfig["maxOutputTokens"] = .number(Double(maximum))
         }
-        generationConfig["temperature"] = .number(request.generationOptions.temperature)
+        // Absent rather than null when not set: the API's default
+        if let temperature = request.generationOptions.temperature {
+            generationConfig["temperature"] = .number(temperature)
+        }
 
         var hasToolOutput = false
         for entry in request.transcript {
@@ -144,7 +147,7 @@ enum GeminiRequestBuilder {
         }
 
         var body: [String: GeminiJSONValue] = [
-            "contents": .array(contents),
+            "contents": .array(merged(contents)),
             "generationConfig": .object(generationConfig),
         ]
         if !systemParts.isEmpty { body["systemInstruction"] = .object(["parts": .array(systemParts)]) }
@@ -175,6 +178,31 @@ enum GeminiRequestBuilder {
 
     private static func content(role: String, parts: [GeminiJSONValue]) -> GeminiJSONValue {
         .object(["role": .string(role), "parts": .array(parts)])
+    }
+
+    /// Gemini expects a turn as it gave it: the model's text and function calls in one content, then the responses
+    /// to that turn's calls together, as many as the calls. The transcript has an entry for each, which made
+    /// consecutive contents of the same role once the model wrote text before a call, or made several calls: the
+    /// request was then refused ("Request contains an invalid argument"). A content without parts is refused too.
+    private static func merged(_ contents: [GeminiJSONValue]) -> [GeminiJSONValue] {
+        var result: [GeminiJSONValue] = []
+        for content in contents {
+            guard case .array(let parts)? = content["parts"], !parts.isEmpty,
+                  let role = content["role"]?.stringValue else { continue }
+            if let last = result.last,
+               last["role"]?.stringValue == role,
+               case .array(let lastParts)? = last["parts"],
+               role == "model" || (isFunctionResponses(lastParts) && isFunctionResponses(parts)) {
+                result[result.count - 1] = self.content(role: role, parts: lastParts + parts)
+            } else {
+                result.append(content)
+            }
+        }
+        return result
+    }
+
+    private static func isFunctionResponses(_ parts: [GeminiJSONValue]) -> Bool {
+        parts.allSatisfy { $0["functionResponse"] != nil }
     }
 
     private static func parts(from segments: [Transcript.Segment]) -> [GeminiJSONValue] {
